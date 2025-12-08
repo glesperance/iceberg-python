@@ -52,6 +52,7 @@ from pyiceberg.manifest import (
     ManifestEntryStatus,
     ManifestFile,
     ManifestWriter,
+    write_delete_manifest,
     write_manifest,
     write_manifest_list,
 )
@@ -108,6 +109,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
     _snapshot_id: int
     _parent_snapshot_id: int | None
     _added_data_files: list[DataFile]
+    _added_delete_files: list[DataFile]
     _manifest_num_counter: itertools.count[int]
     _deleted_data_files: set[DataFile]
     _compression: AvroCompressionCodec
@@ -128,6 +130,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         self._operation = operation
         self._snapshot_id = self._transaction.table_metadata.new_snapshot_id()
         self._added_data_files = []
+        self._added_delete_files = []
         self._deleted_data_files = set()
         self.snapshot_properties = snapshot_properties
         self._manifest_num_counter = itertools.count(0)
@@ -152,6 +155,11 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
 
     def append_data_file(self, data_file: DataFile) -> _SnapshotProducer[U]:
         self._added_data_files.append(data_file)
+        return self
+
+    def append_delete_file(self, delete_file: DataFile) -> _SnapshotProducer[U]:
+        """Add a positional delete file (deletion vector) to the snapshot."""
+        self._added_delete_files.append(delete_file)
         return self
 
     def delete_data_file(self, data_file: DataFile) -> _SnapshotProducer[U]:
@@ -230,13 +238,46 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             else:
                 return []
 
+        def _write_positional_delete_manifest() -> list[ManifestFile]:
+            """Write a manifest for positional delete files (deletion vectors)."""
+            if self._added_delete_files:
+                format_version = self._transaction.table_metadata.format_version
+                with write_delete_manifest(
+                    format_version=format_version,
+                    spec=self._transaction.table_metadata.spec(),
+                    schema=self._transaction.table_metadata.schema(),
+                    output_file=self.new_manifest_output(),
+                    snapshot_id=self._snapshot_id,
+                    avro_compression=self._compression,
+                ) as writer:
+                    for delete_file in self._added_delete_files:
+                        writer.add(
+                            ManifestEntry.from_args(
+                                _table_format_version=format_version,  # Use V3 schema for DV fields
+                                status=ManifestEntryStatus.ADDED,
+                                snapshot_id=self._snapshot_id,
+                                sequence_number=None,
+                                file_sequence_number=None,
+                                data_file=delete_file,
+                            )
+                        )
+                return [writer.to_manifest_file()]
+            else:
+                return []
+
         executor = ExecutorFactory.get_or_create()
 
         added_manifests = executor.submit(_write_added_manifest)
         delete_manifests = executor.submit(_write_delete_manifest)
+        positional_delete_manifests = executor.submit(_write_positional_delete_manifest)
         existing_manifests = executor.submit(self._existing_manifests)
 
-        return self._process_manifests(added_manifests.result() + delete_manifests.result() + existing_manifests.result())
+        return self._process_manifests(
+            added_manifests.result()
+            + delete_manifests.result()
+            + positional_delete_manifests.result()
+            + existing_manifests.result()
+        )
 
     def _summary(self, snapshot_properties: dict[str, str] = EMPTY_DICT) -> Summary:
         from pyiceberg.table import TableProperties
@@ -300,9 +341,12 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             writer.add_manifests(new_manifests)
 
         first_row_id: int | None = None
+        added_rows: int | None = None
 
         if self._transaction.table_metadata.format_version >= 3:
             first_row_id = self._transaction.table_metadata.next_row_id
+            # Calculate added rows for V3 row lineage tracking
+            added_rows = self._calculate_added_rows(new_manifests)
 
         snapshot = Snapshot(
             snapshot_id=self._snapshot_id,
@@ -312,6 +356,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             summary=summary,
             schema_id=self._transaction.table_metadata.current_schema_id,
             first_row_id=first_row_id,
+            added_rows=added_rows,
         )
 
         add_snapshot_update = AddSnapshotUpdate(snapshot=snapshot)

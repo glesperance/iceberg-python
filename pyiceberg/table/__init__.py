@@ -304,12 +304,16 @@ class Transaction:
         """Set the table to a certain version.
 
         Args:
-            format_version: The newly set version.
+            format_version: The newly set version (1, 2, or 3).
 
         Returns:
             The alter table builder.
+
+        Note:
+            Upgrading to V3 enables deletion vector support for merge-on-read deletes.
+            After upgrade, set 'write.delete.mode' to 'merge-on-read' to use DVs.
         """
-        if format_version not in {1, 2}:
+        if format_version not in {1, 2, 3}:
             raise ValueError(f"Unsupported table format version: {format_version}")
 
         if format_version < self.table_metadata.format_version:
@@ -652,14 +656,27 @@ class Transaction:
             _expression_to_complementary_pyarrow,
         )
 
-        if (
-            self.table_metadata.properties.get(TableProperties.DELETE_MODE, TableProperties.DELETE_MODE_DEFAULT)
-            == TableProperties.DELETE_MODE_MERGE_ON_READ
-        ):
-            warnings.warn("Merge on read is not yet supported, falling back to copy-on-write", stacklevel=2)
-
         if isinstance(delete_filter, str):
             delete_filter = _parse_row_filter(delete_filter)
+
+        delete_mode = self.table_metadata.properties.get(TableProperties.DELETE_MODE, TableProperties.DELETE_MODE_DEFAULT)
+
+        # Use MOR with deletion vectors for V3 tables when requested
+        if delete_mode == TableProperties.DELETE_MODE_MERGE_ON_READ:
+            if self.table_metadata.format_version >= 3:
+                self._delete_with_deletion_vectors(
+                    delete_filter=delete_filter,
+                    snapshot_properties=snapshot_properties,
+                    case_sensitive=case_sensitive,
+                    branch=branch,
+                )
+                return
+            else:
+                raise ValueError(
+                    f"Merge on read with deletion vectors requires format version 3, "
+                    f"but table is version {self.table_metadata.format_version}. "
+                    f"Either upgrade the table to V3 or use copy-on-write delete mode."
+                )
 
         with self.update_snapshot(snapshot_properties=snapshot_properties, branch=branch).delete() as delete_snapshot:
             delete_snapshot.delete_by_predicate(delete_filter, case_sensitive)
@@ -725,6 +742,44 @@ class Transaction:
 
         if not delete_snapshot.files_affected and not delete_snapshot.rewrites_needed:
             warnings.warn("Delete operation did not match any records", stacklevel=2)
+
+    def _delete_with_deletion_vectors(
+        self,
+        delete_filter: BooleanExpression,
+        snapshot_properties: Properties = EMPTY_DICT,
+        case_sensitive: bool = True,
+        branch: str | None = MAIN_BRANCH,
+    ) -> None:
+        """Perform a merge-on-read delete using deletion vectors (V3 feature).
+
+        Instead of rewriting data files, this method:
+        1. Scans files to find matching row positions
+        2. Writes deletion vectors to a Puffin file
+        3. Commits the DV file as a delete manifest entry
+
+        Args:
+            delete_filter: A boolean expression to identify rows to delete
+            snapshot_properties: Custom properties to be added to the snapshot summary
+            case_sensitive: Whether the filter is case-sensitive
+            branch: Branch to commit to
+        """
+        from pyiceberg.table.deletion_vector import delete_with_deletion_vectors
+
+        result = delete_with_deletion_vectors(
+            table=self._table,
+            delete_filter=delete_filter,
+            io=self._table.io,
+            case_sensitive=case_sensitive,
+        )
+
+        if not result.deletion_vectors:
+            warnings.warn("Delete operation did not match any records", stacklevel=2)
+            return
+
+        # Commit the deletion vector file
+        with self.update_snapshot(snapshot_properties=snapshot_properties, branch=branch).overwrite() as overwrite_snapshot:
+            for dv_data_file in result.dv_data_files:
+                overwrite_snapshot.append_delete_file(dv_data_file)
 
     def upsert(
         self,
