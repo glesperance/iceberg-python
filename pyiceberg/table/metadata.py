@@ -65,7 +65,7 @@ INITIAL_SEQUENCE_NUMBER = 0
 INITIAL_SPEC_ID = 0
 DEFAULT_SCHEMA_ID = 0
 
-SUPPORTED_TABLE_FORMAT_VERSION = 2
+SUPPORTED_TABLE_FORMAT_VERSION = 3
 
 
 def cleanup_snapshot_id(data: dict[str, Any]) -> dict[str, Any]:
@@ -564,9 +564,6 @@ class TableMetadataV3(TableMetadataCommonFields, IcebergBaseModel):
     next_row_id: int | None = Field(alias="next-row-id", default=None)
     """A long higher than all assigned row IDs; the next snapshot's `first-row-id`."""
 
-    def model_dump_json(self, exclude_none: bool = True, exclude: Any | None = None, by_alias: bool = True, **kwargs: Any) -> str:
-        raise NotImplementedError("Writing V3 is not yet supported, see: https://github.com/apache/iceberg-python/issues/1551")
-
 
 TableMetadata = Annotated[TableMetadataV1 | TableMetadataV2 | TableMetadataV3, Field(discriminator="format_version")]
 
@@ -635,6 +632,7 @@ def new_table_metadata(
             properties=properties,
             last_partition_id=fresh_partition_spec.last_assigned_field_id,
             table_uuid=table_uuid,
+            next_row_id=0,  # V3 requires next_row_id for row lineage tracking
         )
     else:
         raise ValidationError(f"Unknown format version: {format_version}")

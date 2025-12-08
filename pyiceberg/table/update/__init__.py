@@ -312,7 +312,14 @@ def _(
     elif update.format_version == base_metadata.format_version:
         return base_metadata
 
-    updated_metadata = base_metadata.model_copy(update={"format_version": update.format_version})
+    updates: dict[str, Any] = {"format_version": update.format_version}
+
+    # V3 requires next_row_id for adding snapshots. Initialize to 0 - existing
+    # rows don't get row IDs (would require full rewrite), but new rows will.
+    if update.format_version >= 3:
+        updates["next_row_id"] = 0
+
+    updated_metadata = base_metadata.model_copy(update=updates)
 
     context.add_update(update)
     return TableMetadataUtil._construct_without_validation(updated_metadata)
