@@ -1027,10 +1027,14 @@ class ManifestWriter(ABC):
         return AvroOutputFile[ManifestEntry](
             output_file=self._output_file,
             file_schema=self._with_partition(self.version),
-            record_schema=self._with_partition(DEFAULT_READ_VERSION),
+            record_schema=self._with_partition(self._record_schema_version),
             schema_name="manifest_entry",
             metadata=self._meta,
         )
+
+    @property
+    def _record_schema_version(self) -> TableVersion:
+        return DEFAULT_READ_VERSION
 
     @abstractmethod
     def prepare_entry(self, entry: ManifestEntry) -> ManifestEntry: ...
@@ -1178,6 +1182,75 @@ class ManifestWriterV2(ManifestWriter):
         return entry
 
 
+class ManifestWriterV3(ManifestWriter):
+    """Manifest writer for V3 tables."""
+
+    def __init__(
+        self,
+        spec: PartitionSpec,
+        schema: Schema,
+        output_file: OutputFile,
+        snapshot_id: int,
+        avro_compression: AvroCompressionCodec,
+    ):
+        super().__init__(spec, schema, output_file, snapshot_id, avro_compression)
+
+    def content(self) -> ManifestContent:
+        return ManifestContent.DATA
+
+    @property
+    def version(self) -> TableVersion:
+        return 3
+
+    def prepare_entry(self, entry: ManifestEntry) -> ManifestEntry:
+        if entry.sequence_number is None:
+            if entry.snapshot_id is not None and entry.snapshot_id != self._snapshot_id:
+                raise ValueError(f"Found unassigned sequence number for an entry from snapshot: {entry.snapshot_id}")
+            if entry.status != ManifestEntryStatus.ADDED:
+                raise ValueError("Only entries with status ADDED can have null sequence number")
+        return entry
+
+
+class DeleteManifestWriterV3(ManifestWriter):
+    """Manifest writer for positional delete files (V3 format) with DV field support."""
+
+    def __init__(
+        self,
+        spec: PartitionSpec,
+        schema: Schema,
+        output_file: OutputFile,
+        snapshot_id: int,
+        avro_compression: AvroCompressionCodec,
+    ):
+        super().__init__(spec, schema, output_file, snapshot_id, avro_compression)
+
+    def content(self) -> ManifestContent:
+        return ManifestContent.DELETES
+
+    @property
+    def version(self) -> TableVersion:
+        return 3
+
+    @property
+    def _record_schema_version(self) -> TableVersion:
+        return 3
+
+    @property
+    def _meta(self) -> dict[str, str]:
+        return {
+            **super()._meta,
+            "content": "deletes",
+        }
+
+    def prepare_entry(self, entry: ManifestEntry) -> ManifestEntry:
+        if entry.sequence_number is None:
+            if entry.snapshot_id is not None and entry.snapshot_id != self._snapshot_id:
+                raise ValueError(f"Found unassigned sequence number for an entry from snapshot: {entry.snapshot_id}")
+            if entry.status != ManifestEntryStatus.ADDED:
+                raise ValueError("Only entries with status ADDED can have null sequence number")
+        return entry
+
+
 def write_manifest(
     format_version: TableVersion,
     spec: PartitionSpec,
@@ -1190,8 +1263,24 @@ def write_manifest(
         return ManifestWriterV1(spec, schema, output_file, snapshot_id, avro_compression)
     elif format_version == 2:
         return ManifestWriterV2(spec, schema, output_file, snapshot_id, avro_compression)
+    elif format_version == 3:
+        return ManifestWriterV3(spec, schema, output_file, snapshot_id, avro_compression)
     else:
         raise ValueError(f"Cannot write manifest for table version: {format_version}")
+
+
+def write_delete_manifest(
+    format_version: TableVersion,
+    spec: PartitionSpec,
+    schema: Schema,
+    output_file: OutputFile,
+    snapshot_id: int,
+    avro_compression: AvroCompressionCodec,
+) -> ManifestWriter:
+    """Create a manifest writer for deletion vector files."""
+    if format_version != 3:
+        raise ValueError(f"Delete manifests with DVs require format version 3, got {format_version}")
+    return DeleteManifestWriterV3(spec, schema, output_file, snapshot_id, avro_compression)
 
 
 class ManifestListWriter(ABC):
@@ -1312,6 +1401,53 @@ class ManifestListWriterV2(ManifestListWriter):
         return wrapped_manifest_file
 
 
+class ManifestListWriterV3(ManifestListWriter):
+    """Manifest list writer for V3 tables."""
+
+    _commit_snapshot_id: int
+    _sequence_number: int
+
+    def __init__(
+        self,
+        output_file: OutputFile,
+        snapshot_id: int,
+        parent_snapshot_id: int | None,
+        sequence_number: int,
+        compression: AvroCompressionCodec,
+    ):
+        super().__init__(
+            format_version=3,
+            output_file=output_file,
+            meta={
+                "snapshot-id": str(snapshot_id),
+                "parent-snapshot-id": str(parent_snapshot_id) if parent_snapshot_id is not None else "null",
+                "sequence-number": str(sequence_number),
+                "format-version": "3",
+                AVRO_CODEC_KEY: compression,
+            },
+        )
+        self._commit_snapshot_id = snapshot_id
+        self._sequence_number = sequence_number
+
+    def prepare_manifest(self, manifest_file: ManifestFile) -> ManifestFile:
+        wrapped_manifest_file = copy(manifest_file)
+
+        if wrapped_manifest_file.sequence_number == UNASSIGNED_SEQ:
+            if self._commit_snapshot_id != wrapped_manifest_file.added_snapshot_id:
+                raise ValueError(
+                    f"Found unassigned sequence number for a manifest from snapshot: {self._commit_snapshot_id} != {wrapped_manifest_file.added_snapshot_id}"
+                )
+            wrapped_manifest_file.sequence_number = self._sequence_number
+
+        if wrapped_manifest_file.min_sequence_number == UNASSIGNED_SEQ:
+            if self._commit_snapshot_id != wrapped_manifest_file.added_snapshot_id:
+                raise ValueError(
+                    f"Found unassigned sequence number for a manifest from snapshot: {wrapped_manifest_file.added_snapshot_id}"
+                )
+            wrapped_manifest_file.min_sequence_number = self._sequence_number
+        return wrapped_manifest_file
+
+
 def write_manifest_list(
     format_version: TableVersion,
     output_file: OutputFile,
@@ -1326,5 +1462,9 @@ def write_manifest_list(
         if sequence_number is None:
             raise ValueError(f"Sequence-number is required for V2 tables: {sequence_number}")
         return ManifestListWriterV2(output_file, snapshot_id, parent_snapshot_id, sequence_number, avro_compression)
+    elif format_version == 3:
+        if sequence_number is None:
+            raise ValueError(f"Sequence-number is required for V3 tables: {sequence_number}")
+        return ManifestListWriterV3(output_file, snapshot_id, parent_snapshot_id, sequence_number, avro_compression)
     else:
         raise ValueError(f"Cannot write manifest list for table version: {format_version}")
